@@ -1,0 +1,74 @@
+###IMPORT E CONTROLLI BASE
+
+import pandas as pd
+
+path = "NYC_resturants_clean.csv"  # se è nella stessa cartella dello script
+df = pd.read_csv(path, sep=";", encoding="utf-8")  # usa sep=";" se separatore è punto e virgola
+
+# Controlli rapidi
+print(df.shape)
+print(df.dtypes)
+print(df.head())
+print(df.isna().sum())
+
+###STATISTICHE DESCRITTIVE 
+print(df[['Price','Food','Decor','Service']].describe())
+
+print("Distribuzione tipi di locale:")
+print(df['Type'].value_counts())
+
+print("Distribuzione East/West:")
+print(df['East'].value_counts())
+
+###VISUALIZZAZIONI ESPLORATIVE 
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Istogrammi delle variabili numeriche
+df[['Price','Food','Decor','Service']].hist(figsize=(8,6))
+plt.tight_layout()
+plt.show()
+
+# Boxplot per capire outlier
+sns.boxplot(x="Type", y="Price", data=df)
+plt.xticks(rotation=45)
+plt.show()
+
+###ANALISI GEOGRAFICA 
+import pandas as pd
+import folium
+
+path = "NYC_resturants_clean.csv"
+
+# Rilettura robusta
+df = pd.read_csv(
+    path,
+    sep=";",          # separatore colonne
+    encoding="utf-8", # o "cp1252"/"latin1" se serve
+    decimal=",",      # decimali con virgola
+    thousands="."     # separatore migliaia
+)
+
+# Cast sicuro a numerico (se qualche riga sporca)
+for col in ["Price","Food","Decor","Service","latitude","longitude"]:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# Drop righe senza coordinate valide
+df_map = df.dropna(subset=["latitude","longitude"]).copy()
+
+# Mappa centrata sulla media delle coordinate
+center = [df_map["latitude"].mean(), df_map["longitude"].mean()]
+m = folium.Map(location=center, zoom_start=12)
+
+for _, row in df_map.iterrows():
+    folium.CircleMarker(
+        location=[row["latitude"], row["longitude"]],
+        radius=3,
+        color=("red" if str(row.get("East", "")) in ["1", "East"] else "blue"),
+        popup=str(row.get("Restaurant","(no name)"))
+    ).add_to(m)
+
+m.save("map_restaurants.html")
+print("✅ Mappa salvata in map_restaurants.html")
+

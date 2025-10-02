@@ -1,0 +1,164 @@
+# -*- coding: utf-8 -*-
+# ACCENTURE – Analisi ristoranti NYC
+# Step: cleaning lat/long, correlazioni, regressione log, ANOVA, t-test, mappa Folium
+
+import os
+import pandas as pd
+import numpy as np
+
+# === CONFIG ===
+CSV_PATH = "NYC_resturants_clean.csv"  # se è nella stessa cartella dello script
+OUTPUT_DIR = "outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# === LETTURA ROBUSTA DEL CSV (gestisce ; e decimali con ,) ===
+def read_csv_smart(path):
+    # primo tentativo: formato "italiano"
+    try:
+        df = pd.read_csv(path, sep=";", decimal=",", thousands=".", engine="python")
+        if df.shape[1] >= 5:
+            return df
+    except Exception:
+        pass
+    # secondo: formato standard con virgole
+    try:
+        df = pd.read_csv(path, engine="python")
+        return df
+    except Exception as e:
+        raise e
+
+df = read_csv_smart(CSV_PATH)
+
+# === PULIZIA COLONNE CHIAVE ===
+# normalizza nomi
+df.columns = [c.strip() for c in df.columns]
+
+# converti lat/long a float se sono stringhe con virgola
+for col in ["latitude", "longitude", "Price", "Food", "Decor", "Service"]:
+    if col in df.columns:
+        if df[col].dtype == object:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.replace(".", "", regex=False)  # rimuovi separatore migliaia 1.234
+                .str.replace(",", ".", regex=False) # converti virgola decimale
+            )
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# East e Type come categorie leggibili
+if "East" in df.columns:
+    # se East è 0/1, fallo diventare East/West
+    if set(pd.Series(df["East"]).dropna().unique()).issubset({0,1}):
+        df["East"] = df["East"].map({0:"West", 1:"East"})
+    df["East"] = df["East"].astype("category")
+
+if "Type" in df.columns:
+    df["Type"] = df["Type"].astype("category")
+
+# elimina righe senza coordinate per la mappa
+df_map = df.dropna(subset=["latitude","longitude"]).copy()
+
+# salva una versione normalizzata
+df.to_csv(os.path.join(OUTPUT_DIR, "NYC_resturants_clean_normalized.csv"), index=False)
+
+# === CORRELAZIONI ===
+num_cols = [c for c in ["Price","Food","Decor","Service"] if c in df.columns]
+corr = df[num_cols].corr(method="pearson")
+corr.to_csv(os.path.join(OUTPUT_DIR, "correlations.csv"))
+print("\n=== Correlazioni (Pearson) ===")
+print(corr)
+
+# === REGRESSIONE LOG-LINEARE ===
+# log(Price) come dipendente (solo se Price > 0)
+import statsmodels.formula.api as smf
+
+df_reg = df.dropna(subset=["Price","Food","Decor","Service","Type","East"]).copy()
+df_reg = df_reg[df_reg["Price"] > 0].copy()
+df_reg["logPrice"] = np.log(df_reg["Price"])
+
+formula = "logPrice ~ Food + Decor + Service + C(Type) + C(East)"
+model = smf.ols(formula=formula, data=df_reg).fit()
+print("\n=== Regressione log-lineare ===")
+print(model.summary())
+
+# salva il summary su file
+with open(os.path.join(OUTPUT_DIR, "regression_summary.txt"), "w") as f:
+    f.write(model.summary().as_text())
+
+# === ANOVA per Type (sul prezzo) ===
+from statsmodels.stats.anova import anova_lm
+model_anova = smf.ols("Price ~ C(Type)", data=df.dropna(subset=["Price","Type"])).fit()
+anova_res = anova_lm(model_anova, typ=2)
+print("\n=== ANOVA Price ~ Type ===")
+print(anova_res)
+anova_res.to_csv(os.path.join(OUTPUT_DIR, "anova_type.csv"))
+
+# === t-test East vs West (sul prezzo) ===
+from scipy import stats
+sub = df.dropna(subset=["Price","East"])
+east_prices = sub.loc[sub["East"]=="East","Price"]
+west_prices = sub.loc[sub["East"]=="West","Price"]
+t_stat, p_val = stats.ttest_ind(east_prices, west_prices, equal_var=False, nan_policy="omit")
+print("\n=== t-test Price: East vs West (Welch) ===")
+print(f"t = {t_stat:.3f}, p = {p_val:.5f}, n_east={east_prices.shape[0]}, n_west={west_prices.shape[0]}")
+with open(os.path.join(OUTPUT_DIR, "ttest_east_west.txt"), "w") as f:
+    f.write(f"t = {t_stat:.6f}, p = {p_val:.6f}, n_east={east_prices.shape[0]}, n_west={west_prices.shape[0]}")
+
+# === MAPPA FOLIUM con layer Prezzo e Qualità ===
+import folium
+from branca.colormap import linear
+
+# indice qualità semplice (tunable)
+def quality_index(row):
+    # pesi: Food 0.5, Service 0.3, Decor 0.2
+    return 0.5*row.get("Food", np.nan) + 0.3*row.get("Service", np.nan) + 0.2*row.get("Decor", np.nan)
+
+df_map["QualityIdx"] = df_map.apply(quality_index, axis=1)
+
+# centro mappa
+center = [df_map["latitude"].mean(), df_map["longitude"].mean()]
+m = folium.Map(location=center, zoom_start=12, tiles="cartodbpositron")
+
+# Layer Prezzo
+fg_price = folium.FeatureGroup(name="Prezzo").add_to(m)
+price_min, price_max = df_map["Price"].min(), df_map["Price"].max()
+cmap_price = linear.YlOrRd_09.scale(price_min, price_max)
+
+for _, r in df_map.iterrows():
+    folium.CircleMarker(
+        location=[r["latitude"], r["longitude"]],
+        radius=4,
+        color=cmap_price(r["Price"]) if pd.notna(r["Price"]) else "#999999",
+        fill=True,
+        fill_opacity=0.8,
+        popup=f"{r.get('Restaurant','')}\nPrice: {r.get('Price','')}"
+    ).add_to(fg_price)
+
+# Layer Qualità
+fg_quality = folium.FeatureGroup(name="Qualità (indice)").add_to(m)
+q_min, q_max = df_map["QualityIdx"].min(), df_map["QualityIdx"].max()
+cmap_quality = linear.Blues_09.scale(q_min, q_max)
+
+for _, r in df_map.iterrows():
+    folium.CircleMarker(
+        location=[r["latitude"], r["longitude"]],
+        radius=4,
+        color=cmap_quality(r["QualityIdx"]) if pd.notna(r["QualityIdx"]) else "#777777",
+        fill=True,
+        fill_opacity=0.8,
+        popup=f"{r.get('Restaurant','')}\nQualityIdx: {r.get('QualityIdx',''):.2f}"
+    ).add_to(fg_quality)
+
+# legende
+cmap_price.caption = "Prezzo"
+cmap_price.add_to(m)
+cmap_quality.caption = "Qualità (indice)"
+cmap_quality.add_to(m)
+
+folium.LayerControl(collapsed=False).add_to(m)
+MAP_OUT = os.path.join(OUTPUT_DIR, "map_restaurants_layers.html")
+m.save(MAP_OUT)
+print(f"\n✅ Mappa salvata: {MAP_OUT}")
+
+print("\n✅ Fatti: cleaning lat/long, correlazioni, regressione log, ANOVA, t-test, mappa.")
+print(f"   Output in cartella: {os.path.abspath(OUTPUT_DIR)}")
